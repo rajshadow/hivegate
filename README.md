@@ -1,4 +1,4 @@
-# HiveGate
+# HiveGate: AI agent runtime
 
 **Run your Agno agents as a production API.**
 
@@ -339,6 +339,9 @@ Platform-specific deployment manifests and guides live under `deploy/`:
 | `DEEPSEEK_API_KEY` | * | DeepSeek API key |
 | `DOCS_ENABLED` | No | Default: `true`. Controls the OpenAPI documentation endpoints at `/docs` and `/redoc`; set to `false` to disable them. |
 | `CORS_ORIGIN_LIST` | No | Default: `[]`. Additional allowed CORS origins. `http://localhost` and `http://localhost:3000` are always added to the configured origins, with duplicates removed. |
+| `BRIGHT_DATA_API_KEY` | No | Bright Data API key; required to use the Bright Data toolkit |
+| `BRIGHT_DATA_WEB_UNLOCKER_ZONE` | No | Bright Data Web Unlocker zone (default: `web_unlocker1`) |
+| `BRIGHT_DATA_SERP_ZONE` | No | Bright Data SERP zone (default: `serp_api1`) |
 | `QDRANT_URL` | No | Qdrant vector database URL |
 | `SECRET_TOKEN_ENC_KEY` | For OAuth tokens | Fernet key that encrypts stored OAuth tokens. Storing a token fails without it. Generate one with `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` |
 | `PRICING_OVERRIDES` | No | JSON of per-model prices for [usage metering](#usage-and-cost) |
@@ -404,6 +407,10 @@ HiveGate is built in the open, and these people have contributed to it:
 - [@Arun100203](https://github.com/Arun100203) — fixed `docker compose up --wait` by removing
   the Qdrant healthcheck that always failed (#154), and mapped the OAuth discovery metadata
   of GitHub's hosted MCP server (#139)
+- [@rajshadow](https://github.com/rajshadow) — made `POST /v2/agents/{id}/session/clear` actually
+  delete the session and its runs, instead of reporting success and keeping them (#161)
+- [@arpitkjaiswal](https://github.com/arpitkjaiswal) — documented the Bright Data toolkit's three
+  settings in the README's Environment Variables table (#147)
 
 There are [good first issues](https://github.com/hivegate-ai/hivegate/labels/good%20first%20issue)
 open now, each small and self-contained. Comment on one and it's yours.
