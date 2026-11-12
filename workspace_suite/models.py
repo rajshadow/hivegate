@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, Literal, Optional, Sequence
+from datetime import date, datetime
+from enum import Enum, auto
+from typing import Any, Dict, Final, Literal, Optional, Sequence
 
 
 # Calendar
@@ -92,6 +93,63 @@ class ContactResult:
     resource_name: Optional[str] = None
     etag: Optional[str] = None
     error: Optional[Dict[str, Any]] = None
+
+
+# Tasks
+@dataclass(frozen=True)
+class TaskList:
+    id: str
+    title: str
+
+
+@dataclass(frozen=True)
+class Task:
+    """A task as represented by the shared provider contract.
+
+    A due value is a calendar date (the precision supported by Google Tasks).
+    Providers map completed tasks to "completed" and all other states to "open"
+    (for example, Microsoft To Do's notStarted, inProgress, waitingOnOthers,
+    and deferred states all map to "open").
+    """
+
+    id: str
+    title: str
+    list_id: str
+    status: Literal["open", "completed"]
+    notes: str | None = None
+    due: date | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class TaskCreateRequest:
+    title: str
+    notes: str | None = None
+    due: date | None = None
+
+
+class _Unset(Enum):
+    UNSET = auto()
+
+
+UNSET: Final = _Unset.UNSET
+
+
+@dataclass(frozen=True)
+class TaskUpdateRequest:
+    """Fields to change on an existing task.
+
+    UNSET preserves the current field value. A supplied value replaces it.
+    Use None to clear notes or a due date. Replacement notes must be nonempty.
+    """
+
+    title: str | _Unset = UNSET
+    notes: str | None | _Unset = UNSET
+    due: date | None | _Unset = UNSET
+
+    def __post_init__(self) -> None:
+        if self.notes == "":
+            raise ValueError("Use None to clear notes.")
 
 
 # Free/Busy
