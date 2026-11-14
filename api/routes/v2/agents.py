@@ -6,7 +6,10 @@ import os
 import time
 import uuid
 import zlib
+from collections import Counter
+from collections.abc import Hashable
 from contextlib import AsyncExitStack, aclosing
+from dataclasses import dataclass
 from threading import Lock
 from typing import Any, AsyncGenerator, Dict, List, Optional, cast
 from urllib.parse import urlsplit
@@ -15,6 +18,8 @@ from agno.agent import Agent
 from agno.db.base import SessionType
 from agno.exceptions import ModelAuthenticationError, ModelProviderError
 from agno.media import Image
+from agno.run import RunContext, RunStatus
+from agno.run.agent import RunOutput, RunPausedEvent
 
 # agno.models.metrics.Metrics was only a backward-compat alias of RunMetrics, and
 # agno 3 removed it. RunMetrics lives in agno.metrics from 2.6 through 3.x.
@@ -36,7 +41,7 @@ from agents.provider_models import humanize_billing_error
 from agents.v2_selector import _get_prompt_from_local_storage
 from api.provider_errors import error_payload, failed_run_response, run_error_event
 from api.services import usage as usage_service
-from api.services.access_token import fetch_access_token, has_access_tokens_batch  # noqa: F401
+from api.services.access_token import fetch_access_token, has_access_tokens_batch
 from api.services.auth import get_api_key
 from api.services.models import PullPromptResponse
 from api.services.prompts_client import prompts_client
@@ -56,11 +61,31 @@ from db.agent_info_crud import (
 )
 from db.db_models import ApiKeyDB
 from db.session import get_db
+from toolkits.base import BaseToolkit
+
+
+@dataclass(frozen=True)
+class ChatApprovalOwner:
+    api_key_id: int | None
+    agent_id: str
+    model: Model
+    user_id: str
+    session_id: str
+
+
+@dataclass(frozen=True)
+class PausedChat:
+    owner: ChatApprovalOwner
+    agent: Agent
+    run: RunOutput | RunPausedEvent
+    tools: tuple[Any, ...]
+    targets: tuple[Hashable, ...]
+
 
 # Agent caching infrastructure
 _agent_cache: Dict[str, Agent] = {}
 _cache_lock = Lock()
-_run_cache: Dict[str, Any] = {}
+_run_cache: Dict[str, PausedChat] = {}
 
 # Toolkit execution cache for confirmation flow
 _toolkit_execution_cache: Dict[str, Dict[str, Any]] = {}
@@ -196,13 +221,13 @@ def compute_cache_key(
         prompt_name: Prompt identity, which also determines the session table
 
     Returns:
-        Cache key string: "crc32_hash:agent_id:model_id"
+        Encoded prompt, agent, model, user and session identifiers.
     """
     prompt_identity = json.dumps([prompt_name, prompt_template]) if prompt_name is not None else prompt_template
     crc32_hash = zlib.crc32(prompt_identity.encode("utf-8")) & 0xFFFFFFFF
     # The resolved id, not the alias: when "anthropic:sonnet-latest" moves to a newer
     # model, a cached agent built on the old one must not keep being served.
-    return f"{crc32_hash}:{agent_id}:{resolve_model_id(model)}:{user_id}:{session_id}"
+    return json.dumps([crc32_hash, agent_id, resolve_model_id(model), user_id, session_id])
 
 
 # Every model call is metered by api/services/usage.py: one priced token_usage row per
@@ -602,10 +627,71 @@ class ClearSessionResponse(BaseModel):
     message: str
 
 
+def _cache_paused_chat(
+    owner: ChatApprovalOwner, agent: Agent, run: RunOutput | RunPausedEvent, context: RunContext
+) -> None:
+    run_id = getattr(run, "run_id", None)
+    if not run_id:
+        return
+    if not isinstance(run, RunPausedEvent) and getattr(run, "status", None) != RunStatus.paused:
+        return
+    tools = tuple(context.tools or ())
+    targets = _native_approval_targets(tools, run)
+    with _cache_lock:
+        _run_cache[run_id] = PausedChat(owner, agent, run, tools, targets)
+
+
+def _chat_tool_summaries(run: RunOutput) -> list[dict[str, Any]]:
+    return [
+        {
+            "tool_call_id": tool.tool_call_id,
+            "tool_name": tool.tool_name,
+            "requires_confirmation": tool.requires_confirmation,
+            "tool_args": tool.tool_args,
+            "result": _parse_result(tool.result),
+        }
+        for tool in run.tools or []
+    ]
+
+
+def _native_approval_targets(
+    tools: tuple[Any, ...], run: RunOutput | RunPausedEvent, *, active_for_user: str | None = None
+) -> tuple[Hashable, ...]:
+    """Resolve native toolkit identities for the pending calls in this pause."""
+    awaiting_execution = {
+        call.tool_name
+        for call in run.tools or []
+        if call.tool_name and call.requires_confirmation and call.result is None
+    }
+    matching = [
+        tool
+        for tool in tools
+        if isinstance(tool, BaseToolkit) and awaiting_execution.intersection(tool.get_async_functions())
+    ]
+    if active_for_user is not None:
+        services = [tool.service_name for tool in matching if tool.auth]
+        if services:
+            available = has_access_tokens_batch(active_for_user, services)
+            matching = [tool for tool in matching if not tool.auth or available.get(tool.service_name)]
+    # The snapshot retains these instances. Toolkit equality itself omits the user binding.
+    return tuple((tool.service_name, id(tool)) for tool in matching)
+
+
+def _chat_run_context(agent: Agent, owner: ChatApprovalOwner, session_state: dict) -> RunContext:
+    return RunContext(
+        run_id=str(uuid.uuid4()),
+        session_id=owner.session_id,
+        user_id=owner.user_id,
+        session_state=session_state,
+        tools=list(agent.tools) if isinstance(agent.tools, list) else [],
+    )
+
+
 async def commit_response_streamer_v2(
     agent: Agent,
     body: CommitRequest,
-    cached_run: Any,
+    paused: PausedChat,
+    context: RunContext,
     db: Session = Depends(get_db),
     usage_ctx: Optional[usage_service.UsageContext] = None,
 ) -> AsyncGenerator:
@@ -615,7 +701,8 @@ async def commit_response_streamer_v2(
     Args:
         agent: The agent instance to interact with
         body: CommitRequest with run_id and updated_tools
-        cached_run: Cached run output with updated tools
+        paused: Original pause and the validated approval owner
+        context: Agno context with the original run's tool selection
         db: Database session
 
     Yields:
@@ -626,9 +713,12 @@ async def commit_response_streamer_v2(
     # agno 3 resumes from `requirements` and ignores `updated_tools` - see agents/hitl.py.
     run_response = agent.acontinue_run(
         run_id=body.run_id,
-        requirements=requirements_for(cached_run, cached_run.tools),
+        requirements=requirements_for(paused.run, paused.run.tools),
+        run_context=context,
+        user_id=body.user_id,
+        session_id=body.session_id,
         stream=True,
-    )  # type: ignore[misc]
+    )
     chunk_count = 0
     full_output_text = ""
     collector = usage_service.UsageCollector(
@@ -653,6 +743,9 @@ async def commit_response_streamer_v2(
             # "can only concatenate str (not dict) to str" and aborted the stream.
             if isinstance(event_data.get("content"), str):
                 full_output_text += event_data["content"]
+
+            if isinstance(chunk, RunPausedEvent) and not chunk.parent_run_id:
+                _cache_paused_chat(paused.owner, agent, chunk, context)
 
             # Process tools using shared helper function
             _process_tools_in_event(event_data)
@@ -683,16 +776,13 @@ async def commit_response_streamer_v2(
         await usage_service.shielded(record_usage(collector))
         logging.debug(f"Completed v2 streaming commit response with {chunk_count} chunks")
 
-        # Clean up run cache
-        if body.run_id in _run_cache:
-            del _run_cache[body.run_id]
-
 
 async def chat_response_streamer_v2(
     agent: Agent,
     body: ChatRequest,
     db: Session = Depends(get_db),
     usage_ctx: Optional[usage_service.UsageContext] = None,
+    approval_owner: ChatApprovalOwner | None = None,
 ) -> AsyncGenerator:
     """
     Stream agent responses chunk by chunk (v2 implementation).
@@ -756,7 +846,7 @@ async def chat_response_streamer_v2(
 
         logging.debug(f"Built multimodal content with {len(image_objects)} images and {len(file_objects)} files")
 
-    run_config = {
+    run_config: dict[str, Any] = {
         "knowledge_filters": knowledge_filters,
         "session_state": session_state,
     }
@@ -767,6 +857,11 @@ async def chat_response_streamer_v2(
     collector.set_model(*usage_service.model_of(agent))
     collector.input_text = body.message
 
+    context = None
+    if approval_owner is not None:
+        context = _chat_run_context(agent, approval_owner, session_state)
+        run_config.update(run_id=context.run_id, run_context=context)
+
     try:
         run_response = agent.arun(
             body.message,
@@ -775,7 +870,7 @@ async def chat_response_streamer_v2(
             stream=True,
             **run_config,
         )  # type: ignore[call-overload]
-        async with aclosing(run_response):
+        async with aclosing(cast(AsyncGenerator, run_response)):
             async for chunk in run_response:
                 chunk_count += 1
                 if chunk_count % 10 == 0:  # Log every 10 chunks to avoid excessive logging
@@ -797,9 +892,13 @@ async def chat_response_streamer_v2(
                 if isinstance(event_data.get("content"), str):
                     full_output_text += event_data["content"]
 
-                # Cache the run for later commit if run_id is present
-                if "run_id" in event_data and event_data["run_id"]:
-                    _run_cache[event_data["run_id"]] = chunk
+                if (
+                    approval_owner is not None
+                    and context is not None
+                    and isinstance(chunk, RunPausedEvent)
+                    and not chunk.parent_run_id
+                ):
+                    _cache_paused_chat(approval_owner, agent, chunk, context)
 
                 # Process tools using shared helper function
                 _process_tools_in_event(event_data)
@@ -1081,8 +1180,6 @@ async def chat_with_agent_v2(
                 failure_response = failed_run_response(response, body.model)
                 if failure_response is not None:
                     return failure_response
-                if hasattr(response, "run_id") and response.run_id:
-                    _run_cache[response.run_id] = response
                 tools_dict = []
                 if hasattr(response, "tools") and response.tools:
                     for tool in response.tools:
@@ -1123,11 +1220,13 @@ async def chat_with_agent_v2(
             _agent_cache[cache_key] = agent
             logging.info(f"Agent cached with key: {_log_safe(cache_key)}")
 
+        approval_owner = ChatApprovalOwner(usage_ctx.api_key_id, agent_id, body.model, body.user_id, body.session_id)
+
         # Execute agent run
         if body.stream:
             logging.info(f"Returning v2 streaming response for agent: {_log_safe(agent_id)}")
             return StreamingResponse(
-                chat_response_streamer_v2(agent, body, db, usage_ctx),
+                chat_response_streamer_v2(agent, body, db, usage_ctx, approval_owner),
                 media_type="text/event-stream",
             )
         else:
@@ -1189,6 +1288,7 @@ async def chat_with_agent_v2(
                 "session_state": session_state,
             }
 
+            context = _chat_run_context(agent, approval_owner, session_state)
             collector = usage_service.UsageCollector(usage_ctx)
             collector.set_model(*usage_service.model_of(agent))
             collector.input_text = body.message
@@ -1198,6 +1298,8 @@ async def chat_with_agent_v2(
                     images=image_objects if image_objects else None,
                     files=file_objects if file_objects else None,
                     stream=False,
+                    run_id=context.run_id,
+                    run_context=context,
                     **run_config,
                 )  # type: ignore[call-overload]
             except (ModelAuthenticationError, ModelProviderError) as e:
@@ -1215,22 +1317,7 @@ async def chat_with_agent_v2(
             if failure_response is not None:
                 return failure_response
 
-            # Cache the run for later commit
-            if hasattr(response, "run_id") and response.run_id:
-                _run_cache[response.run_id] = response
-
-            # Convert tools to dict format
-            tools_dict = []
-            if hasattr(response, "tools") and response.tools:
-                for tool in response.tools:
-                    tool_dict = {
-                        "tool_call_id": getattr(tool, "tool_call_id", None),
-                        "tool_name": getattr(tool, "tool_name", None),
-                        "requires_confirmation": getattr(tool, "requires_confirmation", False),
-                        "tool_args": getattr(tool, "tool_args", None),
-                        "result": _parse_result(getattr(tool, "result", None)),
-                    }
-                    tools_dict.append(tool_dict)
+            _cache_paused_chat(approval_owner, agent, response, context)
 
             return ChatResponse(
                 content=response.content if hasattr(response, "content") else None,  # type: ignore[arg-type]
@@ -1240,7 +1327,7 @@ async def chat_with_agent_v2(
                 token_usage=token_usage,
                 status=response.status,
                 run_id=response.run_id if hasattr(response, "run_id") else None,  # type: ignore[arg-type]
-                tools=tools_dict,
+                tools=_chat_tool_summaries(response),
             )
 
     except HTTPException:
@@ -1460,21 +1547,46 @@ async def commit_agent_chat_v2(
     try:
         logging.info(f"Commit request for agent {_log_safe(agent_id)}, run_id: {_log_safe(body.run_id)}")
 
-        # Check if any tool has confirmed=false (user denial)
-        # Only consider tools that have an explicit confirmed field (ignore None/missing)
-        tools_with_confirmation = [tool for tool in body.updated_tools if tool.get("confirmed") is not None]
-        all_denied = len(tools_with_confirmation) > 0 and all(
-            tool.get("confirmed") is False for tool in tools_with_confirmation
-        )
+        updates_by_id = {}
+        for update in body.updated_tools:
+            call_id = update.get("tool_call_id") or update.get("id")
+            if isinstance(call_id, str) and isinstance(update.get("confirmed"), bool):
+                updates_by_id[call_id] = update
+        all_denied = bool(updates_by_id) and all(update["confirmed"] is False for update in updates_by_id.values())
 
-        # Retrieve cached run
-        if body.run_id not in _run_cache:
-            logging.error(f"Run ID {_log_safe(body.run_id)} not found in cache")
-            # If all tools are denied and run_id not found, return denial response without error
+        usage_ctx = usage_service.context_for(agent_id, body, api_key, kind="commit")
+        owner = ChatApprovalOwner(usage_ctx.api_key_id, agent_id, body.model, body.user_id, body.session_id)
+        with _cache_lock:
+            paused = _run_cache.get(body.run_id)
+            if paused is not None and paused.owner != owner:
+                paused = None
+            decisions = []
+            if paused is not None:
+                calls = paused.run.tools or []
+                # Agno can retain denied calls with no result in subsequent pauses.
+                decisions = [
+                    (tool, updates_by_id[tool.tool_call_id])
+                    for tool in calls
+                    if tool.tool_call_id in updates_by_id
+                    and tool.requires_confirmation
+                    and tool.confirmed is None
+                    and tool.result is None
+                ]
+                if not decisions:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, detail="The tool decision is no longer pending."
+                    )
+                # A decision contains no pause identifier beyond its run and tool call IDs.
+                call_counts = Counter(tool.tool_call_id for tool in calls)
+                if any(call_counts[tool.tool_call_id] != 1 for tool, _ in decisions):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="The tool call ID was reused. Start a new request for approval.",
+                    )
+                all_denied = all(update["confirmed"] is False for _, update in decisions)
             if all_denied:
-                logging.info(
-                    f"Run ID {_log_safe(body.run_id)} not found but all tools denied - returning denial response"
-                )
+                if paused is not None:
+                    del _run_cache[body.run_id]
                 return ChatResponse(
                     content="Tool execution cancelled by user.",
                     agent_id=agent_id,
@@ -1482,62 +1594,57 @@ async def commit_agent_chat_v2(
                     model=body.model,
                     status="cancelled",
                 )
-            # Otherwise, the confirmation time window has elapsed
+
+        if paused is None:
             raise HTTPException(
                 status_code=status.HTTP_410_GONE,
-                detail="Confirmation time window has elapsed. The run is no longer available for resumption.",
+                detail="The pending run is no longer available in this chat. Start a new request.",
             )
-
-        cached_run = _run_cache[body.run_id]
-
-        # Check if user denied all tools (confirmed=false)
-        if all_denied:
-            logging.info(f"User denied all tools for run_id: {_log_safe(body.run_id)}")
-            # Clean up run cache
-            if body.run_id in _run_cache:
-                del _run_cache[body.run_id]
-            return ChatResponse(
-                content="Tool execution cancelled by user.",
-                agent_id=agent_id,
-                session_id=body.session_id,
-                model=body.model,
-                status="cancelled",
+        agent, _, _, _ = await get_agent(db, agent_id, body.model, body.user_id, body.session_id)
+        if agent is not paused.agent:
+            raise HTTPException(status_code=status.HTTP_410_GONE, detail="The original chat is unavailable.")
+        with _cache_lock:
+            if _run_cache.get(body.run_id) is not paused:
+                raise HTTPException(status_code=status.HTTP_410_GONE, detail="This approval is no longer pending.")
+            # Claim the pause before dispatch, including when a stream runs later.
+            del _run_cache[body.run_id]
+        tools = tuple(agent.tools) if isinstance(agent.tools, list) else ()
+        if _native_approval_targets(tools, paused.run, active_for_user=owner.user_id) != paused.targets:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The toolkit connection changed. Start a new request for approval.",
             )
+        # Agno uses this snapshot even if another chat changes the shared agent's tools.
+        context = RunContext(
+            run_id=body.run_id, session_id=body.session_id, user_id=body.user_id, tools=list(paused.tools)
+        )
 
         # Update tools with user confirmations/edits
         UPDATABLE_FIELDS = {"tool_args", "args", "confirmed", "confirmation_note"}
-        for updated_tool_dict in body.updated_tools:
-            tool_id = updated_tool_dict.get("tool_call_id") or updated_tool_dict.get("id")
-            # Find and update the original tool object
-            for original_tool in cached_run.tools:
-                if getattr(original_tool, "tool_call_id", None) == tool_id:
-                    # Update allowed fields
-                    for key, value in updated_tool_dict.items():
-                        if key in UPDATABLE_FIELDS and hasattr(original_tool, key):
-                            setattr(original_tool, key, value)
-                    break
-
-        # Find agent in cache.
-        agent, _, _, _ = await get_agent(db, agent_id, body.model, body.user_id, body.session_id)
-        if not agent:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id} not found in cache")
+        for original_tool, update in decisions:
+            for key in UPDATABLE_FIELDS.intersection(update):
+                if hasattr(original_tool, key):
+                    setattr(original_tool, key, update[key])
 
         # Continue the run with updated tools
         if body.stream:
             logging.info(f"Returning v2 streaming response for commit: {_log_safe(body.run_id)}")
             return StreamingResponse(
-                commit_response_streamer_v2(
-                    agent, body, cached_run, db, usage_service.context_for(agent_id, body, api_key, kind="commit")
-                ),
+                commit_response_streamer_v2(agent, body, paused, context, db, usage_ctx),
                 media_type="text/event-stream",
             )
         else:
-            collector = usage_service.UsageCollector(usage_service.context_for(agent_id, body, api_key, kind="commit"))
+            collector = usage_service.UsageCollector(usage_ctx)
             collector.set_model(*usage_service.model_of(agent))
             collector.input_text = "[commit continuation]"
             try:
                 response = await agent.acontinue_run(
-                    run_id=body.run_id, requirements=requirements_for(cached_run, cached_run.tools), stream=False
+                    run_id=body.run_id,
+                    requirements=requirements_for(paused.run, paused.run.tools),
+                    user_id=body.user_id,
+                    session_id=body.session_id,
+                    run_context=context,
+                    stream=False,
                 )
             except Exception as e:
                 collector.fail(f"{type(e).__name__}: {e}")
@@ -1549,9 +1656,8 @@ async def commit_agent_chat_v2(
             collector.observe_response(response)
             token_usage = await record_usage(collector)
 
-            # Clean up run cache
-            if body.run_id in _run_cache:
-                del _run_cache[body.run_id]
+            _cache_paused_chat(owner, agent, response, context)
+            paused_again = getattr(response, "status", None) == RunStatus.paused
 
             return ChatResponse(
                 content=response.content,  # type: ignore[arg-type]
@@ -1559,7 +1665,9 @@ async def commit_agent_chat_v2(
                 session_id=getattr(agent, "session_id", None),
                 model=body.model,
                 token_usage=token_usage,  # type: ignore[arg-type]
-                status="completed",
+                status=response.status if paused_again else "completed",
+                run_id=response.run_id if paused_again else None,
+                tools=_chat_tool_summaries(response) if paused_again else None,
             )
 
     except HTTPException:

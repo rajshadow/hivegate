@@ -2,6 +2,7 @@
 Unit tests for V2 agent selector module.
 """
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -143,18 +144,15 @@ class TestAgentSelectorCaching(unittest.TestCase):
 
         cache_key = compute_cache_key(template, agent_id, model, user_id, session_id)
 
-        # Verify CRC32 hash is in the key
         expected_hash = zlib.crc32(template.encode("utf-8")) & 0xFFFFFFFF
-        self.assertTrue(cache_key.startswith(str(expected_hash)))
+        self.assertEqual(json.loads(cache_key), [expected_hash, agent_id, "gemini-2.5-pro", user_id, session_id])
 
-        # Verify key format: "crc32:agent_id:model:user_id:session_id"
-        parts = cache_key.split(":")
-        self.assertEqual(len(parts), 5)
-        self.assertEqual(parts[0], str(expected_hash))
-        self.assertEqual(parts[1], agent_id)
-        self.assertEqual(parts[2], "gemini-2.5-pro")
-        self.assertEqual(parts[3], user_id)
-        self.assertEqual(parts[4], session_id)
+    def test_cache_key_preserves_user_session_boundary(self):
+        from api.routes.v2.agents import compute_cache_key
+
+        with_user_suffix = compute_cache_key("prompt", "agent", Model.gemini_2_5_pro, "user:work", "session")
+        with_session_prefix = compute_cache_key("prompt", "agent", Model.gemini_2_5_pro, "user", "work:session")
+        self.assertNotEqual(with_user_suffix, with_session_prefix)
 
     def test_sel_011_cache_hit(self):
         """SEL-011: Same parameters return cached agent."""

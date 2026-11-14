@@ -5,6 +5,7 @@ Integration tests for V2 agents API endpoints.
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from agents import Model
 from db.db_models import AgentInfoDB
 from tests.test_utils import create_test_client
 
@@ -544,14 +545,17 @@ class TestV2AgentsAPI(unittest.TestCase):
         mock_run.run_id = "run_123"
         mock_run.tools = [
             MagicMock(
-                tool_call_id="call_1", tool_name="schedule_meeting", confirmed=False, tool_args={"summary": "Meeting"}
+                tool_call_id="call_1",
+                tool_name="schedule_meeting",
+                confirmed=None,
+                requires_confirmation=True,
+                result=None,
+                tool_args={"summary": "Meeting"},
             )
         ]
 
         # Add to run cache
-        from api.routes.v2.agents import _run_cache
-
-        _run_cache["run_123"] = mock_run
+        from api.routes.v2.agents import ChatApprovalOwner, PausedChat, _run_cache
 
         # Create mock agent with acontinue_run method
         mock_agent_instance = MagicMock()
@@ -580,9 +584,17 @@ class TestV2AgentsAPI(unittest.TestCase):
 
         mock_get_agent.side_effect = async_get_agent
 
+        _run_cache["run_123"] = PausedChat(
+            ChatApprovalOwner(None, "test-agent-v2", Model.gemini_2_5_pro, "user123", "session456"),
+            mock_agent_instance,
+            mock_run,
+            (),
+            (),
+        )
         commit_request = {
             "run_id": "run_123",
             "updated_tools": [{"tool_call_id": "call_1", "confirmed": True, "confirmation_note": "User confirmed"}],
+            "model": "gemini-2.5-pro",
             "stream": False,
             "user_id": "user123",
             "session_id": "session456",
@@ -1251,13 +1263,13 @@ class TestV2AgentsAPI(unittest.TestCase):
         mock_tool = MagicMock()
         mock_tool.tool_call_id = "call_edit_1"
         mock_tool.tool_name = "schedule_meeting"
-        mock_tool.confirmed = False
+        mock_tool.confirmed = None
+        mock_tool.requires_confirmation = True
+        mock_tool.result = None
         mock_tool.tool_args = {"summary": "Original Meeting", "start": "2025-10-24T10:00:00Z"}
         mock_run.tools = [mock_tool]
 
-        from api.routes.v2.agents import _run_cache
-
-        _run_cache["run_edit_123"] = mock_run
+        from api.routes.v2.agents import ChatApprovalOwner, PausedChat, _run_cache
 
         mock_agent_instance = MagicMock()
         mock_agent_instance.session_id = "session456"
@@ -1286,6 +1298,13 @@ class TestV2AgentsAPI(unittest.TestCase):
         mock_get_agent.side_effect = async_get_agent
 
         # Commit with EDITED tool args
+        _run_cache["run_edit_123"] = PausedChat(
+            ChatApprovalOwner(None, "test-agent-v2", Model.gemini_2_5_pro, "user123", "session456"),
+            mock_agent_instance,
+            mock_run,
+            (),
+            (),
+        )
         commit_request = {
             "run_id": "run_edit_123",
             "updated_tools": [
@@ -1295,6 +1314,7 @@ class TestV2AgentsAPI(unittest.TestCase):
                     "tool_args": {"summary": "Edited Meeting Title", "start": "2025-10-25T14:00:00Z"},  # Edited!
                 }
             ],
+            "model": "gemini-2.5-pro",
             "stream": False,
             "user_id": "user123",
             "session_id": "session456",
@@ -1327,13 +1347,13 @@ class TestV2AgentsAPI(unittest.TestCase):
         mock_tool = MagicMock()
         mock_tool.tool_call_id = "call_reject_1"
         mock_tool.tool_name = "schedule_meeting"
-        mock_tool.confirmed = False
+        mock_tool.confirmed = None
+        mock_tool.requires_confirmation = True
+        mock_tool.result = None
         mock_tool.tool_args = {"summary": "Meeting"}
         mock_run.tools = [mock_tool]
 
-        from api.routes.v2.agents import _run_cache
-
-        _run_cache["run_reject_123"] = mock_run
+        from api.routes.v2.agents import ChatApprovalOwner, PausedChat, _run_cache
 
         mock_agent_instance = MagicMock()
         mock_agent_instance.session_id = "session456"
@@ -1362,6 +1382,13 @@ class TestV2AgentsAPI(unittest.TestCase):
         mock_get_agent.side_effect = async_get_agent
 
         # Commit with REJECTED tools
+        _run_cache["run_reject_123"] = PausedChat(
+            ChatApprovalOwner(None, "test-agent-v2", Model.gemini_2_5_pro, "user123", "session456"),
+            mock_agent_instance,
+            mock_run,
+            (),
+            (),
+        )
         commit_request = {
             "run_id": "run_reject_123",
             "updated_tools": [
@@ -1371,6 +1398,7 @@ class TestV2AgentsAPI(unittest.TestCase):
                     "confirmation_note": "User declined to schedule",
                 }
             ],
+            "model": "gemini-2.5-pro",
             "stream": False,
             "user_id": "user123",
             "session_id": "session456",

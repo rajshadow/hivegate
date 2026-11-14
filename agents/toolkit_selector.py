@@ -1,6 +1,7 @@
 import logging
 from typing import Optional
 
+from agno.run import RunContext
 from agno.tools import tool
 
 from toolkits.calendar import CalendarToolkit
@@ -124,7 +125,7 @@ def create_multi_toolkit_selector(
         >>> # Agent will automatically select appropriate toolkits before each run
     """
 
-    def select_toolkits_hook(agent, run_input):
+    def select_toolkits_hook(agent, run_input, run_context: Optional[RunContext] = None):
         """Pre-hook that dynamically selects toolkits based on token availability."""
         logging.info(f"[Pre-hook] Checking token availability for user {user_id}")
 
@@ -208,6 +209,9 @@ def create_multi_toolkit_selector(
 
         # Combine base tools with toolkits
         all_tools = base_tools + toolkits
+        if run_context is not None and run_context.tools is not None:
+            # Native chat opts into a run-local selection that can be reused on resume.
+            run_context.tools = all_tools
 
         # Get current toolkit string representations for comparison (use str() for BaseToolkit)
         current_toolkit_names = [str(t) if hasattr(t, "__str__") else type(t).__name__ for t in toolkits]

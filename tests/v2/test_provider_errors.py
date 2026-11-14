@@ -49,6 +49,7 @@ class MCP:
 class Runner:
     def __init__(self, result=None, events=(), exception=None):
         self.id = "provider-test"
+        self.tools = []
         self.model = SimpleNamespace(id=MODEL, provider="Google")
         self.result = result
         self.events = events
