@@ -1119,6 +1119,7 @@ async def chat_with_agent_v2(
                 tenant_id=body.tenant_profile.tenant_id if body.tenant_profile else "default_tenant",
                 timezone=body.timezone,
                 config=agent_config,
+                enable_tasks=True,
             )
             _agent_cache[cache_key] = agent
             logging.info(f"Agent cached with key: {_log_safe(cache_key)}")
@@ -1686,6 +1687,12 @@ def _convert_param_types(params: Dict[str, Any]) -> Dict[str, Any]:
     return converted
 
 
+def _direct_toolkit_rejection(toolkit: Any) -> JSONResponse | None:
+    if getattr(toolkit, "allow_direct_invocation", True) is False:
+        return JSONResponse(status_code=404, content={"detail": "This toolkit is available through chat."})
+    return None
+
+
 @v2_agents_router.get("/{agent_id}/toolkit/run", response_model=ToolkitExecutionResponse | ToolkitConfirmRequest)
 async def run_toolkit_method_v2(
     request: Request,
@@ -1719,21 +1726,6 @@ async def run_toolkit_method_v2(
     try:
         logging.info(f"Toolkit execution request: {toolkit_name}.{method_name} for agent {agent_id}")
 
-        # Parse query parameters
-        raw_params = _parse_query_params(request)
-        # Remove toolkit parameters (they're not method arguments)
-        raw_params.pop("toolkit_name", None)
-        raw_params.pop("method_name", None)
-        raw_params.pop("user_id", None)
-        raw_params.pop("session_id", None)
-        raw_params.pop("organizer_email", None)
-        raw_params.pop("model", None)
-        raw_params.pop("skip_confirmation", None)
-
-        # Convert types (booleans, integers, lists)
-        method_kwargs = _convert_param_types(raw_params)
-        logging.info(f"[toolkit/run] Method kwargs: {method_kwargs}")
-
         # Get agent from cache
         agent, _, _, _ = await get_agent(db, agent_id, model, user_id, session_id)
         if not agent:
@@ -1759,6 +1751,24 @@ async def run_toolkit_method_v2(
                 status_code=404,
                 detail=f"Toolkit '{toolkit_name}' not found in agent tools. Available: {[t.__class__.__name__ for t in tools_list]}",
             )
+
+        if rejection := _direct_toolkit_rejection(toolkit):
+            return rejection
+
+        # Parse method arguments only after checking the toolkit's access policy.
+        raw_params = _parse_query_params(request)
+        for field in (
+            "toolkit_name",
+            "method_name",
+            "user_id",
+            "session_id",
+            "organizer_email",
+            "model",
+            "skip_confirmation",
+        ):
+            raw_params.pop(field, None)
+        method_kwargs = _convert_param_types(raw_params)
+        logging.info(f"[toolkit/run] Method kwargs: {method_kwargs}")
 
         # Check if method exists
         if not hasattr(toolkit, method_name):
@@ -1843,6 +1853,8 @@ async def confirm_toolkit_method_v2(agent_id: str, body: ToolkitConfirmRequest, 
 
         # Extract cached data
         toolkit = execution["toolkit"]
+        if rejection := _direct_toolkit_rejection(toolkit):
+            return rejection
         method_name = execution["method_name"]
         method_kwargs = execution["method_kwargs"].copy()  # Copy to avoid modifying cache
         timestamp = execution.get("timestamp", 0)

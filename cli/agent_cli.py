@@ -809,49 +809,10 @@ class ConsoleChatClient:
         return text, media
 
     # ---------- Tool commit flow (NEW) ----------
-    def _should_wait_for_user_input(self, t: Dict[str, Any]) -> bool:
-        """
-        Check if tool is waiting for user input/confirmation.
-        Returns True if BOTH conditions are met:
-        - confirmation_required flag exists and is True, AND
-        - Tool name is in the list of confirmable tools
-        """
-        # Check if confirmation_required field exists and is True
-        if "requires_confirmation" not in t or t["requires_confirmation"] is not True:
-            return False
-
-        # Check tool name is in the list of confirmable tools
-        name = t.get("tool_name", "").lower()
-
-        # List of all confirmable tools across all toolkits
-        confirmable_tools = (
-            # Calendar tools
-            "schedule_meeting",
-            "schedule_meeting_find_time",
-            "cancel_meeting",
-            # Contacts tools
-            "create_contact",
-            "update_contact",
-            "delete_contact",
-            # Drive tools
-            "read_file",
-            "upload_file",
-            "update_file",
-            "create_folder",
-            "delete_file",
-            # Email tools
-            "send_email",
-            "create_draft",
-            "send_draft",
-            "trash_email",
-            "delete_email_permanently",
-            "modify_labels",
+    def _should_wait_for_user_input(self, tool: Dict[str, Any]) -> bool:
+        return (
+            tool.get("requires_confirmation") is True and tool.get("confirmed") is None and tool.get("result") is None
         )
-
-        if name not in confirmable_tools:
-            return False
-
-        return True
 
     def _extract_tools(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract tools list from a response 'output' or stream event 'data'."""
@@ -900,138 +861,88 @@ class ConsoleChatClient:
         return result
 
     def _prompt_and_commit_tools_if_needed(self, data: Dict[str, Any]):
-        """
-        If server returned confirmable tool calls, prompt the user to confirm/edit,
-        then call /chat/commit with the updated tools list. Repeat while needed.
-        """
-        # Extract tools first
-        tools = self._extract_tools(data)
+        """Gather decisions for one paused run and submit them as a batch."""
+        pending = [tool for tool in self._extract_tools(data) if self._should_wait_for_user_input(tool)]
+        if not pending:
+            return
 
-        # Check if any tools require confirmation
-        confirmables = [t for t in tools if self._should_wait_for_user_input(t)]
-        if not confirmables:
-            return  # nothing to commit
+        run_id = data.get("run_id") or data.get("output", {}).get("run_id")
+        if not run_id:
+            print("[warn] No run_id found in response, cannot commit tools")
+            return
 
-        # Check if response status is paused (or has confirmable tools)
-        status = data.get("status", "").lower()
-        if status not in ("paused", "unknown", ""):
-            # If status is explicitly set to something other than paused, and we have confirmables,
-            # warn but don't return (the server may have forgotten to set status to paused)
-            logger.warning(f"Found confirmable tools but status is '{status}', proceeding anyway")
-
-        # Loop until there are no more confirmables (server may chain further pauses)
-        while True:
-            # Extract run_id from the response data
-            run_id = data.get("run_id")
-            if not run_id:
-                # Fallback: check if it's nested in output
-                run_id = data.get("output", {}).get("run_id")
-
-            if not run_id:
-                print("[warn] No run_id found in response, cannot commit tools")
-                return
-
-            # Remember last tools and run_id for /commit command
-            self._last_tools_payload = tools
-            self._last_run_id = run_id
-
-            print("\n=== Pending tool confirmation(s) ===")
-            for idx, t in enumerate(confirmables, 1):
-                print(f" [{idx}] {t.get('tool_name') or t.get('name')} id={t.get('tool_call_id') or t.get('id')}")
-                print(f"      args: {json.dumps(t.get('tool_args') or t.get('args') or {}, ensure_ascii=False)}")
-
-            # NEW: Use InquirerPy to handle each confirmable tool
-            updated_tools: List[Dict[str, Any]] = tools[:]  # start from entire tools payload
-            tools_to_confirm = []
-            should_cancel = False
-
-            for confirmable in confirmables:
-                try:
-                    result = self.dialog_builder.build_dialog_for_tool(confirmable)
-                    action = result["action"]
-                    edited_args = result["edited_args"]
-
-                    if action == "cancel":
-                        print("[info] Cancelled tool confirmation.")
-                        should_cancel = True
-                        break
-                    elif action == "skip":
-                        print(f"[info] Skipped tool: {confirmable.get('tool_name') or confirmable.get('name')}")
-                        continue
-                    elif action == "confirm":
-                        # Update the tool's args in the payload
-                        tool_id = confirmable.get("tool_call_id") or confirmable.get("id")
-                        for t in updated_tools:
-                            if (t.get("tool_call_id") or t.get("id")) == tool_id:
-                                # Update args with edited values
-                                if "tool_args" in t:
-                                    t["tool_args"] = edited_args
-                                else:
-                                    t["args"] = edited_args
-                                # Mark as confirmed
-                                t["confirmed"] = True
-                                t["confirmation_note"] = (t.get("tool_name") or t.get("name") or "confirm").replace(
-                                    "_", "-"
-                                )
-                                tools_to_confirm.append(t)
-                                break
-                        print(f"[info] Confirmed tool: {confirmable.get('tool_name') or confirmable.get('name')}")
-
-                except (KeyboardInterrupt, EOFError):
-                    print("\n[info] Confirmation interrupted by user.")
-                    should_cancel = True
-                    break
-
-            if should_cancel or not tools_to_confirm:
-                if not tools_to_confirm and not should_cancel:
-                    print("[info] No tools confirmed.")
-                return
-
-            # Commit
-            commit_payload = {
-                "run_id": run_id,
-                "updated_tools": updated_tools,
-                "stream": self.stream_flag,
-                "user_id": self.user_id,
-                "session_id": self.session_id,
-                "model": self.model,
-                "timezone": "Asia/Jerusalem",  # User timezone
-                "locale": "en-US",  # User locale (language tag format)
-                "user_profile": {
-                    "profile_id": "id123",
-                    "full_name": "Test User",
-                    "email": "user@example.com",
-                    "role": "user",
-                    "department": "",
-                    "skills": "",
-                    "tools": "",
-                    "org_id": ORG_ID,
-                },
-            }
-            print("\n[commit] POST /chat/commit ...")
-            print(f"[debug] Sending {len(updated_tools)} tools")
-
-            # Handle streaming vs non-streaming commit
-            if self.stream_flag:
-                # Use SSE streaming for commit response
-                self._handle_commit_sse_stream(commit_payload)
-            else:
-                # Non-streaming commit
-                try:
-                    r = requests.post(self.commit_endpoint, json=commit_payload, timeout=180)
-                except requests.RequestException as e:
-                    print(f"[error] commit failed: {e}")
+        # /commit can reopen this prompt if the user skips or cancels.
+        self._last_tools_payload = pending
+        self._last_run_id = run_id
+        updated_tools = []
+        print("\n=== Pending tool confirmation(s) ===")
+        try:
+            for tool in pending:
+                decision = self.dialog_builder.build_dialog_for_tool(tool)
+                action = decision["action"]
+                if action == "cancel":
+                    print("[info] Cancelled tool confirmation.")
                     return
+                if action not in ("confirm", "decline"):
+                    continue
 
-                if r.status_code != 200:
-                    print(f"[error] {r.status_code}: {r.text}")
-                    return
+                updated = {**tool, "confirmed": action == "confirm"}
+                if action == "confirm":
+                    args_key = "tool_args" if "tool_args" in tool else "args"
+                    updated[args_key] = decision["edited_args"]
+                    name = tool.get("tool_name") or tool.get("name") or "confirm"
+                    updated["confirmation_note"] = name.replace("_", "-")
+                updated_tools.append(updated)
+        except (KeyboardInterrupt, EOFError):
+            print("\n[info] Confirmation interrupted by user.")
+            return
 
-                resp = r.json()
-                self.handle_single_response(resp)
+        if not updated_tools:
+            print("[info] No approval decisions to submit.")
+            return
+
+        commit_payload = {
+            "run_id": run_id,
+            "updated_tools": updated_tools,
+            "stream": self.stream_flag,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "model": self.model,
+            "timezone": "Asia/Jerusalem",  # User timezone
+            "locale": "en-US",  # User locale (language tag format)
+            "user_profile": {
+                "profile_id": "id123",
+                "full_name": "Test User",
+                "email": "user@example.com",
+                "role": "user",
+                "department": "",
+                "skills": "",
+                "tools": "",
+                "org_id": ORG_ID,
+            },
+        }
+
+        print("\n[commit] POST /chat/commit ...")
+        if self.stream_flag:
+            self._handle_commit_sse_stream(commit_payload)
+            return
+
+        try:
+            response = requests.post(self.commit_endpoint, json=commit_payload, timeout=180)
+        except requests.RequestException as e:
+            print(f"[error] commit failed: {e}")
+            return
+
+        if response.status_code != 200:
+            print(f"[error] {response.status_code}: {response.text}")
+            return
+
+        self._last_tools_payload = []
+        self._last_run_id = None
+        self.handle_single_response(response.json(), prompt_for_approval=False)
 
     # ---------- Existing handlers ----------
-    def handle_single_response(self, resp: Dict[str, Any]):
+    def handle_single_response(self, resp: Dict[str, Any], *, prompt_for_approval: bool = True):
         """Handle non-streaming response."""
         out = resp.get("output") or resp
         text = out.get("content")
@@ -1059,8 +970,8 @@ class ConsoleChatClient:
         else:
             print(f"\n[{self.format_timestamp()}] Assistant: (no text)")
 
-        # NEW: Prompt/commit if tools require confirmation
-        self._prompt_and_commit_tools_if_needed(out)
+        if prompt_for_approval:
+            self._prompt_and_commit_tools_if_needed(out)
 
     def handle_stream_response(self, resp: Dict[str, Any]):
         """Handle streaming response (legacy JSON mode)."""
@@ -1144,10 +1055,7 @@ class ConsoleChatClient:
             ]
         logger.info(f"Chat request (streaming): {json.dumps(payload_for_log, indent=2)}")
 
-        # Track state from last event for confirmation check at end
-        last_event_tools: List[Dict[str, Any]] = []
-        last_event_status = "unknown"
-        last_event_run_id = None
+        paused_run = None
 
         try:
             with httpx.Client(timeout=300.0) as client:
@@ -1185,19 +1093,8 @@ class ConsoleChatClient:
                                     first_content = False
                                 event_count += 1
 
-                                # Keep state from last event (will be replaced by next event)
-                                if "status" in data:
-                                    last_event_status = data["status"]
-                                if "run_id" in data:
-                                    last_event_run_id = data["run_id"]
-
-                                # Keep tools from last event (will be replaced by next event)
-                                tools = self._extract_tools(data)
-                                if tools:
-                                    last_event_tools = tools
-                                    logger.debug(
-                                        f"Last event had {len(tools)} tools, last tool: {tools[-1].get('tool_name')}"
-                                    )
+                                if data.get("event") == "RunPaused":
+                                    paused_run = data
 
                             except json.JSONDecodeError as e:
                                 print(f"[warn] Failed to parse SSE data: {e}")
@@ -1206,14 +1103,8 @@ class ConsoleChatClient:
 
                     print(f"\n\n[{self.format_timestamp()}] [SSE stream ended - {event_count} events]")
 
-                    # After stream ends, check the last tool from the last event for confirmation
-                    if last_event_tools:
-                        accumulated_data = {
-                            "tools": [last_event_tools[-1]],  # Only the last tool from last event
-                            "status": last_event_status,
-                            "run_id": last_event_run_id,
-                        }
-                        self._prompt_and_commit_tools_if_needed(accumulated_data)
+                    if paused_run is not None:
+                        self._prompt_and_commit_tools_if_needed(paused_run)
 
         except httpx.RequestError as e:
             print(f"[error] SSE request failed: {e}")
@@ -1222,16 +1113,19 @@ class ConsoleChatClient:
 
     def _handle_commit_sse_stream(self, commit_payload: Dict[str, Any]):
         """Handle commit response as SSE stream."""
-        # Track state from last event for confirmation check at end
-        last_event_tools: List[Dict[str, Any]] = []
-        last_event_status = "unknown"
-        last_event_run_id = None
-
         try:
             with httpx.Client(timeout=300.0) as client:
                 with client.stream("POST", self.commit_endpoint, json=commit_payload) as response:
                     if response.status_code != 200:
                         print(f"[error] {response.status_code}: {response.text}")
+                        return
+
+                    self._last_tools_payload = []
+                    self._last_run_id = None
+                    # The gateway can return a JSON cancellation to a streaming commit.
+                    if response.headers.get("content-type", "").split(";", 1)[0] == "application/json":
+                        response.read()
+                        self.handle_single_response(response.json(), prompt_for_approval=False)
                         return
 
                     event_count = 0
@@ -1263,35 +1157,12 @@ class ConsoleChatClient:
                                     first_content = False
                                 event_count += 1
 
-                                # Keep state from last event (will be replaced by next event)
-                                if "status" in data:
-                                    last_event_status = data["status"]
-                                if "run_id" in data:
-                                    last_event_run_id = data["run_id"]
-
-                                # Keep tools from last event (will be replaced by next event)
-                                tools = self._extract_tools(data)
-                                if tools:
-                                    last_event_tools = tools
-                                    logger.debug(
-                                        f"Last event had {len(tools)} tools, last tool: {tools[-1].get('tool_name')}"
-                                    )
-
                             except json.JSONDecodeError as e:
                                 print(f"[warn] Failed to parse commit SSE data: {e}")
                                 print(f"[warn] Raw data: {data_str[:100]}")
                             current_event_type = None
 
                     print(f"\n\n[{self.format_timestamp()}] [commit SSE stream ended - {event_count} events]")
-
-                    # After stream ends, check the last tool from the last event for confirmation (chain commits)
-                    if last_event_tools:
-                        accumulated_data = {
-                            "tools": [last_event_tools[-1]],  # Only the last tool from last event
-                            "status": last_event_status,
-                            "run_id": last_event_run_id,
-                        }
-                        self._prompt_and_commit_tools_if_needed(accumulated_data)
 
         except httpx.RequestError as e:
             print(f"[error] Commit SSE request failed: {e}")

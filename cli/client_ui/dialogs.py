@@ -57,8 +57,34 @@ class DialogBuilder:
         elif tool_name == "read_file":
             return self._build_read_file_dialog(tool)
 
-        # Default handling for other tools
-        return self._build_generic_dialog(tool)
+        # Preserve argument editing for the tools that previously used this dialog.
+        if tool_name in (
+            "schedule_meeting",
+            "schedule_meeting_find_time",
+            "create_contact",
+            "update_contact",
+            "upload_file",
+            "update_file",
+            "create_folder",
+            "create_draft",
+            "trash_email",
+            "modify_labels",
+        ):
+            return self._build_generic_dialog(tool)
+        return self._confirm_read_only(tool_name, tool.get("tool_args") or tool.get("args") or {})
+
+    def _confirm_read_only(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        print(json.dumps(arguments, indent=2, ensure_ascii=True))
+        action = inquirer.select(
+            message=f"Approve {name.replace('_', ' ')}?",
+            choices=[
+                Choice(value="confirm", name="Approve"),
+                Choice(value="decline", name="Decline"),
+                Choice(value="cancel", name="Cancel all"),
+            ],
+            default="decline",
+        ).execute()
+        return {"action": action, "edited_args": arguments}
 
     def _build_cancel_meeting_dialog(self, tool: Dict[str, Any]) -> Dict[str, Any]:
         """

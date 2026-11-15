@@ -30,6 +30,7 @@ from toolkits.calendar import CalendarToolkit
 from toolkits.contacts import ContactsToolkit
 from toolkits.drive import DriveToolkit
 from toolkits.email import EmailToolkit
+from toolkits.tasks import TasksToolkit
 from toolkits.token_cache import TokenCache
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,7 @@ def get_agent(
     config: Optional[AgentConfig] = None,
     db_skills: Optional[List[SkillDB]] = None,
     extra_tools: Optional[list] = None,
+    enable_tasks: bool = False,
 ) -> Agent:
     agent_slug_id = prompt.name
     db_table_name = slug_to_table_name(f"a_{agent_slug_id}_agent")
@@ -419,6 +421,11 @@ def get_agent(
                 auth=False,
             )
 
+    # Add Tasks toolkit candidates (if enabled for this entry point and prompt).
+    additional_toolkits = {}
+    if enable_tasks and "tasks" in available_tools and fetch_token_func and user_id:
+        additional_toolkits["tasks"] = TasksToolkit.provider_candidates(user_id, fetch_token_func)
+
     # Build base tools list conditionally based on available_tools tag
     base_tools_list: list = []
 
@@ -446,8 +453,7 @@ def get_agent(
     if extra_tools:
         base_tools_list.extend(extra_tools)
 
-    # Initialize toolkit selector if organizer_email and fetch_token_func are provided
-    if organizer_email and fetch_token_func and user_id:
+    if (organizer_email and fetch_token_func and user_id) or additional_toolkits:
         # Create the toolkit selector hook (will only select from non-None toolkits)
         # Pass base_tools_list so the pre-hook can preserve them
         pre_hooks = [
@@ -467,6 +473,7 @@ def get_agent(
                 email_google=email_google,
                 email_microsoft=email_microsoft,
                 email_no_auth=email_no_auth,
+                additional_toolkits=additional_toolkits,
             )
         ]
     else:

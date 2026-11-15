@@ -1,8 +1,10 @@
 import logging
+from collections.abc import Mapping, Sequence
 from typing import Optional
 
 from agno.tools import tool
 
+from toolkits.base import BaseToolkit
 from toolkits.calendar import CalendarToolkit
 from toolkits.contacts import ContactsToolkit
 from toolkits.drive import DriveToolkit
@@ -63,6 +65,7 @@ def create_multi_toolkit_selector(
     email_google: Optional[EmailToolkit] = None,
     email_microsoft: Optional[EmailToolkit] = None,
     email_no_auth: Optional[EmailToolkit] = None,
+    additional_toolkits: Mapping[str, Sequence[BaseToolkit]] | None = None,
 ):
     """
     Create a pre-hook function that dynamically selects toolkits based on OAuth token availability.
@@ -77,8 +80,6 @@ def create_multi_toolkit_selector(
     - Google toolkit if google_* token exists
     - Microsoft toolkit if microsoft_* token exists
     - No-auth toolkit (returns auth-required cards) if no tokens exist
-
-    Services checked: Calendar, Contacts, Drive, Email
 
     Toolkit configuration is cached per-agent instance to avoid redundant set_tools() calls
     when the token availability hasn't changed.
@@ -103,6 +104,8 @@ def create_multi_toolkit_selector(
         email_google: Pre-initialized Gmail toolkit instance
         email_microsoft: Pre-initialized Outlook Mail toolkit instance
         email_no_auth: Pre-initialized no-auth Email toolkit (returns auth cards)
+        additional_toolkits: Ordered candidates by toolkit name. Put an optional
+            unauthenticated fallback last.
 
     Returns:
         Callable[[Agent, Any], None]: Pre-hook function that accepts (agent, run_input) and
@@ -124,6 +127,24 @@ def create_multi_toolkit_selector(
         >>> # Agent will automatically select appropriate toolkits before each run
     """
 
+    toolkit_candidates: dict[str, list[tuple[str | None, BaseToolkit | None]]] = {
+        "calendar": [
+            ("google_calendar", calendar_google),
+            ("microsoft_calendar", calendar_microsoft),
+            (None, calendar_no_auth),
+        ],
+        "contacts": [
+            ("google_contacts", contacts_google),
+            ("microsoft_contacts", contacts_microsoft),
+            (None, contacts_no_auth),
+        ],
+        "drive": [("google_drive", drive_google), ("microsoft_drive", drive_microsoft), (None, drive_no_auth)],
+        "email": [("google_gmail", email_google), ("outlook_mail", email_microsoft), (None, email_no_auth)],
+    }
+    for name, candidates in (additional_toolkits or {}).items():
+        toolkit_candidates[name] = [(item.service_name if item.auth else None, item) for item in candidates]
+    integration_keys = [key for candidates in toolkit_candidates.values() for key, _ in candidates if key is not None]
+
     def select_toolkits_hook(agent, run_input):
         """Pre-hook that dynamically selects toolkits based on token availability."""
         logging.info(f"[Pre-hook] Checking token availability for user {user_id}")
@@ -139,72 +160,17 @@ def create_multi_toolkit_selector(
         from api.routes.v2.agents import has_access_tokens_batch
 
         # Batch check all tokens in a SINGLE database query (much faster than individual checks)
-        all_integration_keys = [
-            "google_calendar",
-            "microsoft_calendar",
-            "google_contacts",
-            "microsoft_contacts",
-            "google_drive",
-            "microsoft_drive",
-            "google_gmail",
-            "outlook_mail",
-        ]
-        token_status = has_access_tokens_batch(user_id, all_integration_keys)
+        token_status = has_access_tokens_batch(user_id, integration_keys)
         logging.debug(f"[Pre-hook] Token status: {token_status}")
 
-        # Helper function to add toolkit based on token existence
-        def add_toolkit_by_token(
-            google_service: str,
-            microsoft_service: str,
-            google_toolkit,
-            microsoft_toolkit,
-            no_auth_toolkit,
-            toolkit_name: str,
-        ):
-            # Skip if all toolkits are None (not enabled via available_tools tag)
-            if google_toolkit is None and microsoft_toolkit is None and no_auth_toolkit is None:
-                logging.debug(f"[Pre-hook] {toolkit_name} toolkit not enabled (not in available_tools tag)")
-                return
-
-            # Check if toolkit is in the filter (if filter is provided)
-            if tools_filter is not None:
-                # Normalize toolkit names to lowercase for case-insensitive comparison
-                toolkit_name_lower = toolkit_name.lower()
-                filter_lower = [t.lower() for t in tools_filter]
-                if toolkit_name_lower not in filter_lower:
-                    logging.debug(f"[Pre-hook] {toolkit_name} toolkit filtered out (not in tools_filter)")
-                    return
-
-            # Check token existence from batch results
-            has_google_token = token_status.get(google_service, False)
-            has_microsoft_token = token_status.get(microsoft_service, False)
-
-            # Add appropriate toolkit based on token existence
-            if has_google_token and google_toolkit is not None:
-                logging.debug(f"[Pre-hook] User has {google_service} token, adding Google {toolkit_name} toolkit")
-                toolkits.append(google_toolkit)
-            elif has_microsoft_token and microsoft_toolkit is not None:
-                logging.debug(f"[Pre-hook] User has {microsoft_service} token, adding Microsoft {toolkit_name} toolkit")
-                toolkits.append(microsoft_toolkit)
-            elif no_auth_toolkit is not None:
-                logging.debug(f"[Pre-hook] No {toolkit_name} tokens found, adding no-auth toolkit")
-                toolkits.append(no_auth_toolkit)
-
-        # Add Calendar toolkit (if enabled)
-        add_toolkit_by_token(
-            "google_calendar", "microsoft_calendar", calendar_google, calendar_microsoft, calendar_no_auth, "Calendar"
-        )
-
-        # Add Contacts toolkit (if enabled)
-        add_toolkit_by_token(
-            "google_contacts", "microsoft_contacts", contacts_google, contacts_microsoft, contacts_no_auth, "Contacts"
-        )
-
-        # Add Drive toolkit (if enabled)
-        add_toolkit_by_token("google_drive", "microsoft_drive", drive_google, drive_microsoft, drive_no_auth, "Drive")
-
-        # Add Email toolkit (if enabled)
-        add_toolkit_by_token("google_gmail", "outlook_mail", email_google, email_microsoft, email_no_auth, "Email")
+        enabled = {name.lower() for name in tools_filter} if tools_filter is not None else None
+        for name, candidates in toolkit_candidates.items():
+            if enabled is not None and name.lower() not in enabled:
+                continue
+            for key, toolkit in candidates:
+                if toolkit is not None and (key is None or token_status.get(key, False)):
+                    toolkits.append(toolkit)
+                    break
 
         # Combine base tools with toolkits
         all_tools = base_tools + toolkits

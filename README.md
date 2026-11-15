@@ -263,6 +263,7 @@ The `toolkits/` package provides Agno agent toolkits for external service integr
 | EmailToolkit | Gmail, Outlook | send_email, search_emails, create_draft |
 | ContactsToolkit | Google Contacts, Microsoft Contacts | create_contact, search_contacts, list_contacts |
 | DriveToolkit | Google Drive, OneDrive | list_files, get_file_info, read_file |
+| TasksToolkit | Google Tasks, Microsoft To Do | list_task_lists, list_tasks, create_task, update_task, complete_task, delete_task |
 
 All toolkits support:
 - Confirmation-based workflow (user reviews before execution)

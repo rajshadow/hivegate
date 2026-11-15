@@ -27,6 +27,8 @@ class BaseToolkit(Toolkit, ABC):
     All toolkits (Calendar, Contacts, Drive, Email) inherit from this class.
     """
 
+    allow_direct_invocation = True
+
     def __init__(
         self,
         user_id: str,

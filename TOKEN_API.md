@@ -54,6 +54,19 @@ For JWT-based authentication.
 - `issuer` - Token issuer
 - `audience` - Token audience
 
+## Tasks connections
+
+The trusted client runs the user's delegated OAuth consent flow and stores the resulting grant with `POST /v2/users/{user_id}/tokens`. Use the same HiveGate user ID when calling chat. HiveGate trusts the authenticated client to supply the correct user ID.
+
+| Integration key | Provider | Read and write | Read only |
+|-----------------|----------|----------------|-----------|
+| `google_tasks` | `google` | `https://www.googleapis.com/auth/tasks` | `https://www.googleapis.com/auth/tasks.readonly` |
+| `microsoft_todo` | `microsoft` | `Tasks.ReadWrite` | `Tasks.Read` |
+
+Enable the Google Tasks API in the Google OAuth app's project and request `access_type=offline` to obtain a refresh token. For Microsoft, configure the delegated Graph permission in the Entra app and request `offline_access`. Re-consent when a scope or refresh grant is missing. [Google Tasks scopes](https://developers.google.com/workspace/tasks/auth) · [Google offline access](https://developers.google.com/identity/protocols/oauth2/web-server#offline) · [Microsoft Graph permissions](https://learn.microsoft.com/en-us/graph/permissions-reference#tasksreadwrite) · [Microsoft offline access](https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc#the-offline_access-scope)
+
+Store the grant as `token_type: oauth2` with the delegated access token, refresh token, granted scopes, expiry, and the OAuth client's refresh credentials as required. Use the same integration key when reconnecting. A read-only grant permits listing and may return a permission error for writes.
+
 ## Endpoints
 
 ### Store Token

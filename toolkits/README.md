@@ -52,6 +52,12 @@ toolkit = CalendarToolkit(
 - `auth_required`: Prompt for authentication (when auth=False)
 - `error_card`: Display errors with retry options
 
+### TasksToolkit
+
+Add `available_tools:tasks` to the agent's prompt tags to enable Tasks in native chat and its CLI. HiveGate selects Google Tasks if that user has a Google Tasks connection, then Microsoft To Do if only that connection is present. A user with neither connection sees a connect prompt. See the [Tasks OAuth setup](../TOKEN_API.md#tasks-connections).
+
+Listing runs immediately. Creating, updating, completing, and deleting tasks pause for confirmation through the existing chat flow. The CLI shows the action and arguments for review. See the [method reference](API_REFERENCE.md#taskstoolkit-methods) for the exact arguments and how to clear fields. To retry a write after reconnecting, make a fresh request and approve it again.
+
 ## Additional Agent Tools
 
 ### BrightDataTools (Agno Built-in)
