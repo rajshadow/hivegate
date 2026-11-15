@@ -63,6 +63,7 @@ from db.db_models import ApiKeyDB
 from db.mcp_server_crud import UnknownMCPServersError, get_mcp_servers_by_ids, mcp_server_configs_for_chat
 from db.session import get_db
 from supervisor.models import WorkerConfig
+from toolkits.tasks import TasksToolkit
 
 # Agent caching infrastructure
 _agent_cache: Dict[str, Agent] = {}
@@ -72,6 +73,10 @@ _run_cache: Dict[str, Any] = {}
 # Toolkit execution cache for confirmation flow
 _toolkit_execution_cache: Dict[str, Dict[str, Any]] = {}
 _toolkit_execution_lock = Lock()
+
+# Toolkits offered only by cached native chat, whose approval pause and commit gate their writes.
+# Keyed by available_tools name; each factory returns the toolkit's ordered provider candidates.
+CHAT_TOOLKIT_FACTORIES = {"tasks": TasksToolkit.provider_candidates}
 
 
 class AgnoJSONEncoder(json.JSONEncoder):
@@ -1203,6 +1208,7 @@ async def chat_with_agent_v2(
                 tenant_id=body.tenant_profile.tenant_id if body.tenant_profile else "default_tenant",
                 timezone=body.timezone,
                 config=agent_config,
+                toolkit_factories=CHAT_TOOLKIT_FACTORIES,
             )
             _agent_cache[cache_key] = agent
             logging.info(f"Agent cached with key: {_log_safe(cache_key)}")
@@ -1885,6 +1891,10 @@ async def run_toolkit_method_v2(
                 status_code=404,
                 detail=f"Toolkit '{toolkit_name}' not found in agent tools. Available: {[t.__class__.__name__ for t in tools_list]}",
             )
+
+        # Some toolkits gate their writes on the chat approval flow and are not run directly.
+        if getattr(toolkit, "allow_direct_invocation", True) is False:
+            return JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"detail": "Use chat for this toolkit."})
 
         # Check if method exists
         if not hasattr(toolkit, method_name):

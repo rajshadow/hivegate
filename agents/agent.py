@@ -4,7 +4,7 @@ import time
 import logging
 from datetime import datetime
 from contextlib import AsyncExitStack, asynccontextmanager
-from typing import AsyncIterator, Callable, List, Optional
+from typing import AsyncIterator, Callable, List, Mapping, Optional, Sequence
 
 from agno.agent import Agent
 from functools import lru_cache
@@ -28,6 +28,7 @@ from api.settings import api_settings
 from db.agent_info_crud import AgentConfig
 from db.db_models import SkillDB
 from db.session import db_engine, db_url  # noqa: F401  (db_url kept for callers)
+from toolkits.base import BaseToolkit
 from toolkits.calendar import CalendarToolkit
 from toolkits.contacts import ContactsToolkit
 from toolkits.drive import DriveToolkit
@@ -35,6 +36,8 @@ from toolkits.email import EmailToolkit
 from toolkits.token_cache import TokenCache
 
 logger = logging.getLogger(__name__)
+# Builds a toolkit's ordered provider candidates from (user_id, fetch_token_func)
+ToolkitFactory = Callable[[str, Callable[[str, str], Optional[str]]], Sequence[BaseToolkit]]
 # Create module-level token cache instance
 token_cache = TokenCache()
 
@@ -287,6 +290,7 @@ def get_agent(
     config: Optional[AgentConfig] = None,
     db_skills: Optional[List[SkillDB]] = None,
     extra_tools: Optional[list] = None,
+    toolkit_factories: Optional[Mapping[str, ToolkitFactory]] = None,
 ) -> Agent:
     agent_slug_id = prompt.name
     db_table_name = slug_to_table_name(f"a_{agent_slug_id}_agent")
@@ -436,6 +440,13 @@ def get_agent(
                 auth=False,
             )
 
+    # Further toolkits the caller offers, built from (user_id, fetch_token_func) if the tag enables them
+    toolkit_candidates = {
+        name: factory(user_id, fetch_token_func)
+        for name, factory in (toolkit_factories or {}).items()
+        if name in available_tools and fetch_token_func and user_id
+    }
+
     # Build base tools list conditionally based on available_tools tag
     base_tools_list: list = []
 
@@ -463,8 +474,9 @@ def get_agent(
     if extra_tools:
         base_tools_list.extend(extra_tools)
 
-    # Initialize toolkit selector if organizer_email and fetch_token_func are provided
-    if organizer_email and fetch_token_func and user_id:
+    # Initialize toolkit selector if organizer_email and fetch_token_func are provided,
+    # or if the caller supplied further toolkit candidates
+    if (organizer_email and fetch_token_func and user_id) or toolkit_candidates:
         # Create the toolkit selector hook (will only select from non-None toolkits)
         # Pass base_tools_list so the pre-hook can preserve them
         pre_hooks = [
@@ -484,6 +496,7 @@ def get_agent(
                 email_google=email_google,
                 email_microsoft=email_microsoft,
                 email_no_auth=email_no_auth,
+                toolkit_candidates=toolkit_candidates,
             )
         ]
     else:

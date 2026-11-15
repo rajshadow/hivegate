@@ -988,26 +988,7 @@ class ConsoleChatClient:
                 return
 
             # Commit
-            commit_payload = {
-                "run_id": run_id,
-                "updated_tools": updated_tools,
-                "stream": self.stream_flag,
-                "user_id": self.user_id,
-                "session_id": self.session_id,
-                "model": self.model,
-                "timezone": "Asia/Jerusalem",  # User timezone
-                "locale": "en-US",  # User locale (language tag format)
-                "user_profile": {
-                    "profile_id": "id123",
-                    "full_name": "Test User",
-                    "email": "user@example.com",
-                    "role": "user",
-                    "department": "",
-                    "skills": "",
-                    "tools": "",
-                    "org_id": ORG_ID,
-                },
-            }
+            commit_payload = self._commit_payload(run_id, updated_tools)
             print("\n[commit] POST /chat/commit ...")
             print(f"[debug] Sending {len(updated_tools)} tools")
 
@@ -1030,8 +1011,108 @@ class ConsoleChatClient:
                 resp = r.json()
                 self.handle_single_response(resp)
 
+    def _commit_payload(self, run_id: str, updated_tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Build the /chat/commit request body for a run's tool decisions."""
+        return {
+            "run_id": run_id,
+            "updated_tools": updated_tools,
+            "stream": self.stream_flag,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "model": self.model,
+            "timezone": "Asia/Jerusalem",  # User timezone
+            "locale": "en-US",  # User locale (language tag format)
+            "user_profile": {
+                "profile_id": "id123",
+                "full_name": "Test User",
+                "email": "user@example.com",
+                "role": "user",
+                "department": "",
+                "skills": "",
+                "tools": "",
+                "org_id": ORG_ID,
+            },
+        }
+
+    # ---------- Approval from gateway metadata ----------
+    # Paused batches with a call outside _should_wait_for_user_input's list come here, and are
+    # reviewed and submitted once. Decline sends confirmed=False; Skip leaves the call out.
+    # A toolkit moves to this flow by dropping its tools from that list.
+
+    @staticmethod
+    def _is_pending_approval(tool: Dict[str, Any]) -> bool:
+        """Whether the gateway reports this call as waiting for a decision."""
+        return (
+            tool.get("requires_confirmation") is True and tool.get("confirmed") is None and tool.get("result") is None
+        )
+
+    def _approve_pending_from_metadata(self, data: Dict[str, Any]) -> bool:
+        """
+        Review and submit a paused batch that includes tools outside the confirmable list.
+
+        Returns False, leaving the batch to the existing flow, when every pending call is listed.
+        """
+        pending = [t for t in self._extract_tools(data) if self._is_pending_approval(t)]
+        if all(self._should_wait_for_user_input(t) for t in pending):
+            return False
+
+        run_id = data.get("run_id") or data.get("output", {}).get("run_id")
+        if not run_id:
+            print("[warn] No run_id found in response, cannot commit tools")
+            return True
+        # /commit reopens this batch if nothing gets submitted
+        self._last_tools_payload, self._last_run_id = pending, run_id
+
+        print("\n=== Pending tool confirmation(s) ===")
+        decided: List[Dict[str, Any]] = []
+        for tool in pending:
+            name = tool.get("tool_name") or tool.get("name") or "tool"
+            try:
+                # Listed tools keep their dialogs; others get a read-only review of their arguments
+                if self._should_wait_for_user_input(tool):
+                    result = self.dialog_builder.build_dialog_for_tool(tool)
+                else:
+                    result = self.dialog_builder.build_review_dialog(tool)
+            except (KeyboardInterrupt, EOFError):
+                print("\n[info] Confirmation interrupted by user.")
+                return True
+            action = result["action"]
+            if action == "cancel":
+                print("[info] Cancelled tool confirmation.")
+                return True
+            if action == "confirm":
+                args_key = "tool_args" if "tool_args" in tool else "args"
+                note = name.replace("_", "-")
+                decided.append({**tool, args_key: result["edited_args"], "confirmed": True, "confirmation_note": note})
+            elif action == "decline":
+                decided.append({**tool, "confirmed": False})
+            print(f"[info] {action}: {name}")
+
+        if not decided:
+            print("[info] No approval decisions to submit.")
+            return True
+
+        commit_payload = self._commit_payload(run_id, decided)
+        print("\n[commit] POST /chat/commit ...")
+        # The gateway resumes one pause per commit, so a reply is shown but not prompted again
+        if self.stream_flag:
+            if self._handle_commit_sse_stream(commit_payload, prompt_for_approval=False):
+                self._last_tools_payload, self._last_run_id = [], None
+            return True
+        try:
+            r = requests.post(self.commit_endpoint, json=commit_payload, timeout=180)
+        except requests.RequestException as e:
+            print(f"[error] commit failed: {e}")
+            return True
+        if r.status_code != 200:
+            print(f"[error] {r.status_code}: {r.text}")
+            return True
+        self._last_tools_payload, self._last_run_id = [], None
+        self.handle_single_response(r.json(), prompt_for_approval=False)
+        return True
+
     # ---------- Existing handlers ----------
-    def handle_single_response(self, resp: Dict[str, Any]):
+    def handle_single_response(self, resp: Dict[str, Any], *, prompt_for_approval: bool = True):
         """Handle non-streaming response."""
         out = resp.get("output") or resp
         text = out.get("content")
@@ -1060,7 +1141,8 @@ class ConsoleChatClient:
             print(f"\n[{self.format_timestamp()}] Assistant: (no text)")
 
         # NEW: Prompt/commit if tools require confirmation
-        self._prompt_and_commit_tools_if_needed(out)
+        if prompt_for_approval and not self._approve_pending_from_metadata(out):
+            self._prompt_and_commit_tools_if_needed(out)
 
     def handle_stream_response(self, resp: Dict[str, Any]):
         """Handle streaming response (legacy JSON mode)."""
@@ -1148,6 +1230,7 @@ class ConsoleChatClient:
         last_event_tools: List[Dict[str, Any]] = []
         last_event_status = "unknown"
         last_event_run_id = None
+        paused_run: Optional[Dict[str, Any]] = None  # The RunPaused event carries the whole pending batch
 
         try:
             with httpx.Client(timeout=300.0) as client:
@@ -1198,6 +1281,8 @@ class ConsoleChatClient:
                                     logger.debug(
                                         f"Last event had {len(tools)} tools, last tool: {tools[-1].get('tool_name')}"
                                     )
+                                if data.get("event") == "RunPaused":
+                                    paused_run = data
 
                             except json.JSONDecodeError as e:
                                 print(f"[warn] Failed to parse SSE data: {e}")
@@ -1205,6 +1290,10 @@ class ConsoleChatClient:
                             current_event_type = None
 
                     print(f"\n\n[{self.format_timestamp()}] [SSE stream ended - {event_count} events]")
+
+                    # A paused batch with tools outside the confirmable list goes to the metadata flow
+                    if paused_run is not None and self._approve_pending_from_metadata(paused_run):
+                        return
 
                     # After stream ends, check the last tool from the last event for confirmation
                     if last_event_tools:
@@ -1220,19 +1309,28 @@ class ConsoleChatClient:
         except KeyboardInterrupt:
             print(f"\n[{self.format_timestamp()}] [SSE stream interrupted by user]")
 
-    def _handle_commit_sse_stream(self, commit_payload: Dict[str, Any]):
-        """Handle commit response as SSE stream."""
+    def _handle_commit_sse_stream(self, commit_payload: Dict[str, Any], *, prompt_for_approval: bool = True) -> bool:
+        """Handle commit response as SSE stream. Returns whether the gateway accepted the commit."""
         # Track state from last event for confirmation check at end
         last_event_tools: List[Dict[str, Any]] = []
         last_event_status = "unknown"
         last_event_run_id = None
+        accepted = False
 
         try:
             with httpx.Client(timeout=300.0) as client:
                 with client.stream("POST", self.commit_endpoint, json=commit_payload) as response:
                     if response.status_code != 200:
                         print(f"[error] {response.status_code}: {response.text}")
-                        return
+                        return False
+                    # The gateway has resumed the run, even if reading the reply fails below
+                    accepted = True
+
+                    # A cancelled run is answered with JSON even when streaming was requested
+                    if response.headers.get("content-type", "").startswith("application/json"):
+                        response.read()
+                        self.handle_single_response(response.json(), prompt_for_approval=False)
+                        return True
 
                     event_count = 0
                     current_event_type = None
@@ -1285,7 +1383,7 @@ class ConsoleChatClient:
                     print(f"\n\n[{self.format_timestamp()}] [commit SSE stream ended - {event_count} events]")
 
                     # After stream ends, check the last tool from the last event for confirmation (chain commits)
-                    if last_event_tools:
+                    if last_event_tools and prompt_for_approval:
                         accumulated_data = {
                             "tools": [last_event_tools[-1]],  # Only the last tool from last event
                             "status": last_event_status,
@@ -1297,6 +1395,7 @@ class ConsoleChatClient:
             print(f"[error] Commit SSE request failed: {e}")
         except KeyboardInterrupt:
             print(f"\n[{self.format_timestamp()}] [commit SSE stream interrupted by user]")
+        return accepted
 
     def _process_sse_event(
         self, event_type: str, data: Dict[str, Any], content_buffer: str, first_content: bool
@@ -1661,7 +1760,8 @@ class ConsoleChatClient:
                 return True
             # Offer to re-confirm all confirmables in last payload
             fake_out = {"tools": self._last_tools_payload, "run_id": self._last_run_id}
-            self._prompt_and_commit_tools_if_needed(fake_out)
+            if not self._approve_pending_from_metadata(fake_out):
+                self._prompt_and_commit_tools_if_needed(fake_out)
             return True
 
         elif cmd == "/reload":

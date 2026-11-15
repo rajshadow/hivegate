@@ -60,6 +60,38 @@ class DialogBuilder:
         # Default handling for other tools
         return self._build_generic_dialog(tool)
 
+    def build_review_dialog(self, tool: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build a read-only approval dialog that returns the tool's arguments unchanged.
+
+        Nested values and nulls are shown and sent as received. Decline records an explicit
+        refusal, while Skip leaves the call undecided.
+        """
+        tool_name = tool.get("tool_name") or tool.get("name") or "Unknown"
+        tool_args = tool.get("tool_args") or tool.get("args") or {}
+
+        print(f"\n{'=' * 60}")
+        print(f"  Tool: {tool_name} (id={tool.get('tool_call_id') or tool.get('id') or '?'})")
+        print(f"{'=' * 60}")
+        print(json.dumps(tool_args, indent=2, ensure_ascii=False))
+
+        action = inquirer.select(
+            message=f"Approve {tool_name.replace('_', ' ')}?",
+            choices=[
+                Choice(value="confirm", name="✓ Approve"),
+                Choice(value="decline", name="✗ Decline"),
+                Choice(value="skip", name="⊘ Skip This Tool"),
+                Separator(),
+                Choice(value="cancel", name="✗ Cancel All"),
+            ],
+            default="decline",
+        ).execute()
+
+        return {
+            "action": action,
+            "edited_args": tool_args,
+        }
+
     def _build_cancel_meeting_dialog(self, tool: Dict[str, Any]) -> Dict[str, Any]:
         """
         Build a simplified confirmation dialog for cancel_meeting.
